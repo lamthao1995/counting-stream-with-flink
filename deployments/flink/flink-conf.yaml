@@ -1,0 +1,12 @@
+jobmanager.rpc.address: flink-jobmanager
+jobmanager.rpc.port: 6123
+jobmanager.bind-host: 0.0.0.0
+taskmanager.bind-host: 0.0.0.0
+rest.address: flink-jobmanager
+rest.bind-address: 0.0.0.0
+taskmanager.numberOfTaskSlots: 4
+parallelism.default: 2
+state.backend: rocksdb
+state.checkpoints.dir: file:///opt/flink/checkpoints
+execution.checkpointing.interval: 30 s
+execution.checkpointing.mode: EXACTLY_ONCE

@@ -1,0 +1,28 @@
+# Go
+bin/
+*.test
+*.out
+coverage.*
+vendor/
+
+# Java / Maven
+services/flink-aggregator/target/
+*.class
+*.jar
+!deployments/flink/lib/*.jar
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Env
+.env
+.env.local
+
+# Docker
+.docker-data/
+
+# OS
+.DS_Store
+Thumbs.db

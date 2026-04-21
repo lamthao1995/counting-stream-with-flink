@@ -1,0 +1,167 @@
+# Full local stack. All configuration comes from the repo-root .env file
+# (see .env.example for the full list). Docker compose auto-loads .env
+# when invoked from the repo root (e.g. via `make up`).
+#
+# Boot order:
+#   1. kafka, clickhouse come up first (healthchecks)
+#   2. ingestion + query wait for their deps
+#   3. flink-job-builder compiles the job jar into a shared volume
+#   4. flink-jobmanager + flink-taskmanager use that volume as usrlib
+#   5. operator runs `make submit-flink` to deploy the job
+name: heartbeat
+
+services:
+  kafka:
+    # Official Apache Kafka image running in KRaft single-node mode.
+    image: apache/kafka:3.7.0
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # The apache/kafka image auto-formats the metadata dir if empty, but
+      # KAFKA_CLUSTER_ID must be the same on reboots.
+      CLUSTER_ID: "heartbeat-local-cluster-01"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    ports: ["9092:9092"]
+    volumes:
+      # Persist KRaft metadata + log segments so offsets survive `docker
+      # compose down` (without -v). Without this, the broker would start
+      # with an empty log on every recreate and Flink's committed offsets
+      # would point at segments that no longer exist.
+      - kafka-data:/tmp/kraft-combined-logs
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    environment:
+      CLICKHOUSE_DB:       ${CLICKHOUSE_DATABASE:-default}
+      CLICKHOUSE_USER:     ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports: ["8123:8123", "9000:9000"]
+    volumes:
+      - ./clickhouse/init:/docker-entrypoint-initdb.d:ro
+      # Persist table data across container recreates.
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  flink-job-builder:
+    build:
+      context: ../services/flink-aggregator
+      dockerfile: Dockerfile
+    volumes:
+      - flink-usrlib:/opt/flink/usrlib
+    restart: "no"
+
+  flink-jobmanager:
+    image: flink:1.18-java17
+    command: jobmanager
+    ports: ["8082:8081"]
+    environment:
+      KAFKA_BROKERS:        ${KAFKA_BROKERS:-kafka:9092}
+      KAFKA_TOPIC:          ${KAFKA_TOPIC:-heartbeats}
+      KAFKA_GROUP:          ${KAFKA_GROUP:-flink-aggregator}
+      CH_JDBC_URL:          ${CH_JDBC_URL:-jdbc:clickhouse://clickhouse:8123/default}
+      WINDOW_SECONDS:       ${WINDOW_SECONDS:-60}
+      ALLOWED_LATENESS_SEC: ${ALLOWED_LATENESS_SEC:-30}
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        state.backend: rocksdb
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        execution.checkpointing.interval: 30000
+    volumes:
+      - flink-usrlib:/opt/flink/usrlib
+      # Checkpoints must survive JM/TM restarts for at-least-once replay
+      # to pick up where the job left off.
+      - flink-checkpoints:/opt/flink/checkpoints
+    depends_on:
+      kafka: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+      flink-job-builder: { condition: service_started }
+
+  flink-taskmanager:
+    image: flink:1.18-java17
+    command: taskmanager
+    environment:
+      KAFKA_BROKERS:        ${KAFKA_BROKERS:-kafka:9092}
+      KAFKA_TOPIC:          ${KAFKA_TOPIC:-heartbeats}
+      KAFKA_GROUP:          ${KAFKA_GROUP:-flink-aggregator}
+      CH_JDBC_URL:          ${CH_JDBC_URL:-jdbc:clickhouse://clickhouse:8123/default}
+      WINDOW_SECONDS:       ${WINDOW_SECONDS:-60}
+      ALLOWED_LATENESS_SEC: ${ALLOWED_LATENESS_SEC:-30}
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+    volumes:
+      - flink-usrlib:/opt/flink/usrlib
+      - flink-checkpoints:/opt/flink/checkpoints
+    depends_on:
+      flink-jobmanager: { condition: service_started }
+
+  ingestion:
+    build:
+      context: ..
+      dockerfile: services/ingestion/Dockerfile
+    environment:
+      INGESTION_ADDR:      ${INGESTION_ADDR:-:8080}
+      KAFKA_BROKERS:       ${KAFKA_BROKERS:-kafka:9092}
+      KAFKA_TOPIC:         ${KAFKA_TOPIC:-heartbeats}
+      KAFKA_BATCH_SIZE:    ${KAFKA_BATCH_SIZE:-1000}
+      KAFKA_BATCH_TIMEOUT: ${KAFKA_BATCH_TIMEOUT:-20ms}
+    ports: ["${INGESTION_HOST_PORT:-8080}:8080"]
+    depends_on:
+      kafka: { condition: service_healthy }
+
+  query:
+    build:
+      context: ..
+      dockerfile: services/query/Dockerfile
+    environment:
+      QUERY_ADDR:          ${QUERY_ADDR:-:8081}
+      CLICKHOUSE_ADDRS:    ${CLICKHOUSE_ADDRS:-clickhouse:9000}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-default}
+      CLICKHOUSE_USER:     ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+    ports: ["${QUERY_HOST_PORT:-8081}:8081"]
+    depends_on:
+      clickhouse: { condition: service_healthy }
+
+  # Opt-in with: docker compose --profile stress up --build stress
+  stress:
+    build:
+      context: ..
+      dockerfile: tests/stress/Dockerfile
+    profiles: ["stress"]
+    command:
+      - "--target=${STRESS_TARGET:-http://ingestion:8080}"
+      - "--rps=${STRESS_RPS:-5000}"
+      - "--duration=${STRESS_DURATION:-60s}"
+      - "--batch=${STRESS_BATCH:-10}"
+      - "--devices=${STRESS_DEVICES:-10000}"
+    depends_on:
+      ingestion: { condition: service_started }
+
+volumes:
+  flink-usrlib:
+  flink-checkpoints:
+  kafka-data:
+  clickhouse-data:
