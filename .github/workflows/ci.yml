@@ -80,6 +80,16 @@ jobs:
         run: |
           docker compose --env-file .env.example -f deployments/docker-compose.yml \
             up -d --wait --build kafka clickhouse ingestion query
+      # Pre-create the topic so the very first produce does not race
+      # auto-create (`AUTO_CREATE_TOPICS_ENABLE=true` works, but the first
+      # Metadata response can return LEADER_NOT_AVAILABLE for a moment,
+      # which the Go producer surfaces as a 503 to the HTTP caller).
+      - name: pre-create heartbeats topic
+        run: |
+          docker compose --env-file .env.example -f deployments/docker-compose.yml \
+            exec -T kafka /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server localhost:9092 \
+            --create --if-not-exists --topic heartbeats --partitions 3 --replication-factor 1
       # Wait until the mapped host ports accept connections. 60 * 0.5s = 30s.
       - name: wait for ingestion + query to be ready
         run: |
@@ -96,17 +106,40 @@ jobs:
           wait_http http://localhost:8081/healthz
       - name: post heartbeat + probe query
         run: |
-          curl -fsS -X POST http://localhost:8080/api/v1/heartbeat \
-            -H 'Content-Type: application/json' \
-            -d '{"device_id":"ci","region":"us","status":"ok","timestamp_ms":'$(date +%s%3N)',"latency_ms":1.0}'
-          echo
+          # Retry the POST: even with the topic pre-created, the Go
+          # producer may take a second to open its first Kafka connection
+          # on a cold container. Up to 10 tries * 1s = 10s budget.
+          ok=""
+          for i in $(seq 1 10); do
+            if curl -fsS -X POST http://localhost:8080/api/v1/heartbeat \
+                 -H 'Content-Type: application/json' \
+                 -d '{"device_id":"ci","region":"us","status":"ok","timestamp_ms":'$(date +%s%3N)',"latency_ms":1.0}'; then
+              ok="yes"; echo; break
+            fi
+            echo "heartbeat POST attempt $i failed, retrying..."
+            sleep 1
+          done
+          if [ -z "$ok" ]; then
+            echo "heartbeat POST never succeeded" >&2
+            exit 1
+          fi
           curl -fsS http://localhost:8081/healthz
           echo
       - name: dump logs on failure
         if: failure()
         run: |
+          echo '=== ingestion ==='
           docker compose --env-file .env.example -f deployments/docker-compose.yml \
-            logs --tail=200 ingestion query kafka clickhouse || true
+            logs --tail=200 ingestion || true
+          echo '=== query ==='
+          docker compose --env-file .env.example -f deployments/docker-compose.yml \
+            logs --tail=200 query || true
+          echo '=== kafka ==='
+          docker compose --env-file .env.example -f deployments/docker-compose.yml \
+            logs --tail=200 kafka || true
+          echo '=== clickhouse ==='
+          docker compose --env-file .env.example -f deployments/docker-compose.yml \
+            logs --tail=100 clickhouse || true
       - name: teardown
         if: always()
         run: docker compose --env-file .env.example -f deployments/docker-compose.yml down -v
