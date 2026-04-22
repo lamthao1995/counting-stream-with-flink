@@ -66,37 +66,80 @@ jobs:
         run: docker compose --env-file .env.example -f deployments/docker-compose.yml config --quiet
 
   smoke:
-    name: end-to-end smoke (ingestion + query)
+    name: end-to-end smoke (ingestion + query in compose)
     runs-on: ubuntu-latest
     needs: [go-test, compose-validate]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with: { go-version: "1.22" }
-      - name: bring up kafka + clickhouse only
+      # Run the services inside the compose network so `kafka:9092` (the
+      # advertised listener) resolves naturally. Earlier attempts that ran
+      # the Go binaries on the runner host hit DNS/metadata races against
+      # Docker's virtual network - cleanest fix is to just use the same
+      # topology as production.
+      - name: build + bring up full stack (kafka, clickhouse, ingestion, query)
         run: |
           docker compose --env-file .env.example -f deployments/docker-compose.yml \
-            up -d --wait kafka clickhouse
-      - name: run ingestion + query natively
-        env:
-          KAFKA_BROKERS: "localhost:9092"
-          CLICKHOUSE_ADDRS: "localhost:9000"
+            up -d --wait --build kafka clickhouse ingestion query
+      # Pre-create the topic so the very first produce does not race
+      # auto-create (`AUTO_CREATE_TOPICS_ENABLE=true` works, but the first
+      # Metadata response can return LEADER_NOT_AVAILABLE for a moment,
+      # which the Go producer surfaces as a 503 to the HTTP caller).
+      - name: pre-create heartbeats topic
         run: |
-          go run ./services/ingestion/cmd/ingestion &
-          INGEST_PID=$!
-          go run ./services/query/cmd/query &
-          QUERY_PID=$!
-          sleep 3
-          # send one heartbeat
-          curl -fsS -X POST http://localhost:8080/api/v1/heartbeat \
-            -H 'Content-Type: application/json' \
-            -d '{"device_id":"ci","region":"us","status":"ok","timestamp_ms":'$(date +%s%3N)',"latency_ms":1.0}'
-          # health probe on query
+          docker compose --env-file .env.example -f deployments/docker-compose.yml \
+            exec -T kafka /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server localhost:9092 \
+            --create --if-not-exists --topic heartbeats --partitions 3 --replication-factor 1
+      # Wait until the mapped host ports accept connections. 60 * 0.5s = 30s.
+      - name: wait for ingestion + query to be ready
+        run: |
+          wait_http () {
+            local url=$1
+            for i in $(seq 1 60); do
+              curl -fsS -o /dev/null "$url" && return 0
+              sleep 0.5
+            done
+            echo "timeout waiting for $url" >&2
+            return 1
+          }
+          wait_http http://localhost:8080/healthz
+          wait_http http://localhost:8081/healthz
+      - name: post heartbeat + probe query
+        run: |
+          # Retry the POST: even with the topic pre-created, the Go
+          # producer may take a second to open its first Kafka connection
+          # on a cold container. Up to 10 tries * 1s = 10s budget.
+          ok=""
+          for i in $(seq 1 10); do
+            if curl -fsS -X POST http://localhost:8080/api/v1/heartbeat \
+                 -H 'Content-Type: application/json' \
+                 -d '{"device_id":"ci","region":"us","status":"ok","timestamp_ms":'$(date +%s%3N)',"latency_ms":1.0}'; then
+              ok="yes"; echo; break
+            fi
+            echo "heartbeat POST attempt $i failed, retrying..."
+            sleep 1
+          done
+          if [ -z "$ok" ]; then
+            echo "heartbeat POST never succeeded" >&2
+            exit 1
+          fi
           curl -fsS http://localhost:8081/healthz
-          kill $INGEST_PID $QUERY_PID
+          echo
       - name: dump logs on failure
         if: failure()
-        run: docker compose --env-file .env.example -f deployments/docker-compose.yml logs --tail=200
+        run: |
+          echo '=== ingestion ==='
+          docker compose --env-file .env.example -f deployments/docker-compose.yml \
+            logs --tail=200 ingestion || true
+          echo '=== query ==='
+          docker compose --env-file .env.example -f deployments/docker-compose.yml \
+            logs --tail=200 query || true
+          echo '=== kafka ==='
+          docker compose --env-file .env.example -f deployments/docker-compose.yml \
+            logs --tail=200 kafka || true
+          echo '=== clickhouse ==='
+          docker compose --env-file .env.example -f deployments/docker-compose.yml \
+            logs --tail=100 clickhouse || true
       - name: teardown
         if: always()
         run: docker compose --env-file .env.example -f deployments/docker-compose.yml down -v
