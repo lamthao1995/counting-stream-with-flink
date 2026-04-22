@@ -72,28 +72,58 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: "1.22" }
+        with:
+          go-version: "1.22"
+          cache: true
+          cache-dependency-path: |
+            pkg/go.sum
+            services/ingestion/go.sum
+            services/query/go.sum
+            tests/stress/go.sum
       - name: bring up kafka + clickhouse only
         run: |
           docker compose --env-file .env.example -f deployments/docker-compose.yml \
             up -d --wait kafka clickhouse
+      # Pre-build so the port is listening quickly. `go run` would block on
+      # module downloads + compile (~30s) and the previous `sleep 3` raced
+      # the download, giving curl "connection refused".
+      - name: build ingestion + query
+        run: make build
       - name: run ingestion + query natively
         env:
           KAFKA_BROKERS: "localhost:9092"
           CLICKHOUSE_ADDRS: "localhost:9000"
         run: |
-          go run ./services/ingestion/cmd/ingestion &
+          set -e
+          ./bin/ingestion >/tmp/ingestion.log 2>&1 &
           INGEST_PID=$!
-          go run ./services/query/cmd/query &
+          ./bin/query     >/tmp/query.log     2>&1 &
           QUERY_PID=$!
-          sleep 3
-          # send one heartbeat
+          trap 'kill $INGEST_PID $QUERY_PID 2>/dev/null || true' EXIT
+
+          # Poll until both ports are accepting connections. Fail loudly
+          # after 30s instead of sending curl at a dead port.
+          wait_http () {
+            local url=$1
+            for i in $(seq 1 60); do
+              curl -fsS -o /dev/null "$url" && return 0
+              sleep 0.5
+            done
+            echo "timeout waiting for $url" >&2
+            return 1
+          }
+          wait_http http://localhost:8080/healthz
+          wait_http http://localhost:8081/healthz
+
           curl -fsS -X POST http://localhost:8080/api/v1/heartbeat \
             -H 'Content-Type: application/json' \
             -d '{"device_id":"ci","region":"us","status":"ok","timestamp_ms":'$(date +%s%3N)',"latency_ms":1.0}'
-          # health probe on query
           curl -fsS http://localhost:8081/healthz
-          kill $INGEST_PID $QUERY_PID
+      - name: dump service logs on failure
+        if: failure()
+        run: |
+          echo '=== ingestion ==='; cat /tmp/ingestion.log || true
+          echo '=== query ==='    ; cat /tmp/query.log     || true
       - name: dump logs on failure
         if: failure()
         run: docker compose --env-file .env.example -f deployments/docker-compose.yml logs --tail=200
