@@ -66,50 +66,23 @@ jobs:
         run: docker compose --env-file .env.example -f deployments/docker-compose.yml config --quiet
 
   smoke:
-    name: end-to-end smoke (ingestion + query)
+    name: end-to-end smoke (ingestion + query in compose)
     runs-on: ubuntu-latest
     needs: [go-test, compose-validate]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
-          cache: true
-          cache-dependency-path: |
-            pkg/go.sum
-            services/ingestion/go.sum
-            services/query/go.sum
-            tests/stress/go.sum
-      - name: bring up kafka + clickhouse only
+      # Run the services inside the compose network so `kafka:9092` (the
+      # advertised listener) resolves naturally. Earlier attempts that ran
+      # the Go binaries on the runner host hit DNS/metadata races against
+      # Docker's virtual network - cleanest fix is to just use the same
+      # topology as production.
+      - name: build + bring up full stack (kafka, clickhouse, ingestion, query)
         run: |
           docker compose --env-file .env.example -f deployments/docker-compose.yml \
-            up -d --wait kafka clickhouse
-      # Kafka advertises PLAINTEXT://kafka:9092 to clients. A client that
-      # bootstraps against localhost:9092 still receives "kafka:9092" in
-      # the broker metadata, so producing fails with a DNS error on the
-      # runner. Map the hostname to loopback so advertised listeners
-      # resolve without changing the production compose config.
-      - name: map kafka hostname to localhost
-        run: echo "127.0.0.1 kafka" | sudo tee -a /etc/hosts
-      # Pre-build so the port is listening quickly. `go run` would block on
-      # module downloads + compile (~30s) and the previous `sleep 3` raced
-      # the download, giving curl "connection refused".
-      - name: build ingestion + query
-        run: make build
-      - name: run ingestion + query natively
-        env:
-          KAFKA_BROKERS: "localhost:9092"
-          CLICKHOUSE_ADDRS: "localhost:9000"
+            up -d --wait --build kafka clickhouse ingestion query
+      # Wait until the mapped host ports accept connections. 60 * 0.5s = 30s.
+      - name: wait for ingestion + query to be ready
         run: |
-          set -e
-          ./bin/ingestion >/tmp/ingestion.log 2>&1 &
-          INGEST_PID=$!
-          ./bin/query     >/tmp/query.log     2>&1 &
-          QUERY_PID=$!
-          trap 'kill $INGEST_PID $QUERY_PID 2>/dev/null || true' EXIT
-
-          # Poll until both ports are accepting connections. Fail loudly
-          # after 30s instead of sending curl at a dead port.
           wait_http () {
             local url=$1
             for i in $(seq 1 60); do
@@ -121,19 +94,19 @@ jobs:
           }
           wait_http http://localhost:8080/healthz
           wait_http http://localhost:8081/healthz
-
+      - name: post heartbeat + probe query
+        run: |
           curl -fsS -X POST http://localhost:8080/api/v1/heartbeat \
             -H 'Content-Type: application/json' \
             -d '{"device_id":"ci","region":"us","status":"ok","timestamp_ms":'$(date +%s%3N)',"latency_ms":1.0}'
+          echo
           curl -fsS http://localhost:8081/healthz
-      - name: dump service logs on failure
-        if: failure()
-        run: |
-          echo '=== ingestion ==='; cat /tmp/ingestion.log || true
-          echo '=== query ==='    ; cat /tmp/query.log     || true
+          echo
       - name: dump logs on failure
         if: failure()
-        run: docker compose --env-file .env.example -f deployments/docker-compose.yml logs --tail=200
+        run: |
+          docker compose --env-file .env.example -f deployments/docker-compose.yml \
+            logs --tail=200 ingestion query kafka clickhouse || true
       - name: teardown
         if: always()
         run: docker compose --env-file .env.example -f deployments/docker-compose.yml down -v
